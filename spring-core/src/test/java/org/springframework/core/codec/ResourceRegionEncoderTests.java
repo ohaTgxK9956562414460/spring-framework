@@ -1,5 +1,5 @@
 /*
- * Copyright 2002-2016 the original author or authors.
+ * Copyright 2002-2018 the original author or authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,50 +16,40 @@
 
 package org.springframework.core.codec;
 
-import java.nio.charset.StandardCharsets;
 import java.util.Collections;
+import java.util.function.Consumer;
 
-import org.junit.Before;
 import org.junit.Test;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
-import reactor.test.subscriber.ScriptedSubscriber;
+import reactor.test.StepVerifier;
 
 import org.springframework.core.ResolvableType;
-import org.springframework.core.io.ByteArrayResource;
+import org.springframework.core.io.ClassPathResource;
 import org.springframework.core.io.Resource;
-import org.springframework.core.io.buffer.AbstractDataBufferAllocatingTestCase;
 import org.springframework.core.io.buffer.DataBuffer;
+import org.springframework.core.io.buffer.DataBufferFactory;
 import org.springframework.core.io.buffer.DataBufferUtils;
-import org.springframework.core.io.buffer.DefaultDataBufferFactory;
+import org.springframework.core.io.buffer.LeakAwareDataBufferFactory;
 import org.springframework.core.io.buffer.support.DataBufferTestUtils;
 import org.springframework.core.io.support.ResourceRegion;
 import org.springframework.util.MimeType;
 import org.springframework.util.MimeTypeUtils;
-import org.springframework.util.StringUtils;
 
-import static org.junit.Assert.assertArrayEquals;
-import static org.junit.Assert.assertFalse;
-import static org.junit.Assert.assertTrue;
+import static java.nio.charset.StandardCharsets.UTF_8;
+import static org.junit.Assert.*;
 
 /**
  * Test cases for {@link ResourceRegionEncoder} class.
  *
  * @author Brian Clozel
  */
-public class ResourceRegionEncoderTests extends AbstractDataBufferAllocatingTestCase {
+public class ResourceRegionEncoderTests  {
 
-	private ResourceRegionEncoder encoder;
+	private ResourceRegionEncoder encoder = new ResourceRegionEncoder();
 
-	private Resource resource;
+	private DataBufferFactory bufferFactory = new LeakAwareDataBufferFactory();
 
-	@Before
-	public void setUp() {
-		this.encoder = new ResourceRegionEncoder();
-		String content = "Spring Framework test resource content.";
-		this.resource = new ByteArrayResource(content.getBytes(StandardCharsets.UTF_8));
-		this.bufferFactory = new DefaultDataBufferFactory();
-	}
 
 	@Test
 	public void canEncode() {
@@ -71,30 +61,34 @@ public class ResourceRegionEncoderTests extends AbstractDataBufferAllocatingTest
 		assertFalse(this.encoder.canEncode(ResolvableType.forClass(Resource.class), allMimeType));
 		assertTrue(this.encoder.canEncode(resourceRegion, MimeTypeUtils.APPLICATION_OCTET_STREAM));
 		assertTrue(this.encoder.canEncode(resourceRegion, allMimeType));
+
+		// SPR-15464
+		assertFalse(this.encoder.canEncode(ResolvableType.NONE, null));
 	}
 
 	@Test
-	public void shouldEncodeResourceRegion() throws Exception {
-
-		ResourceRegion region = new ResourceRegion(this.resource, 0, 6);
+	public void shouldEncodeResourceRegionFileResource() throws Exception {
+		ResourceRegion region = new ResourceRegion(
+				new ClassPathResource("ResourceRegionEncoderTests.txt", getClass()), 0, 6);
 		Flux<DataBuffer> result = this.encoder.encode(Mono.just(region), this.bufferFactory,
-				ResolvableType.forClass(ResourceRegion.class), MimeTypeUtils.APPLICATION_OCTET_STREAM
-				, Collections.emptyMap());
+				ResolvableType.forClass(ResourceRegion.class),
+				MimeTypeUtils.APPLICATION_OCTET_STREAM,
+				Collections.emptyMap());
 
-		ScriptedSubscriber.<DataBuffer>create()
+		StepVerifier.create(result)
 				.consumeNextWith(stringConsumer("Spring"))
 				.expectComplete()
-				.verify(result);
+				.verify();
 	}
 
 	@Test
-	public void shouldEncodeMultipleResourceRegions() throws Exception {
-
+	public void shouldEncodeMultipleResourceRegionsFileResource() throws Exception {
+		Resource resource = new ClassPathResource("ResourceRegionEncoderTests.txt", getClass());
 		Flux<ResourceRegion> regions = Flux.just(
-				new ResourceRegion(this.resource, 0, 6),
-				new ResourceRegion(this.resource, 7, 9),
-				new ResourceRegion(this.resource, 17, 4),
-				new ResourceRegion(this.resource, 22, 17)
+				new ResourceRegion(resource, 0, 6),
+				new ResourceRegion(resource, 7, 9),
+				new ResourceRegion(resource, 17, 4),
+				new ResourceRegion(resource, 22, 17)
 		);
 		String boundary = MimeTypeUtils.generateMultipartBoundaryString();
 
@@ -104,41 +98,60 @@ public class ResourceRegionEncoderTests extends AbstractDataBufferAllocatingTest
 				Collections.singletonMap(ResourceRegionEncoder.BOUNDARY_STRING_HINT, boundary)
 		);
 
-		Mono<DataBuffer> reduced = result
-				.reduce(bufferFactory.allocateBuffer(), (previous, current) -> {
-					previous.write(current);
-					DataBufferUtils.release(current);
-					return previous;
-				});
-
-		ScriptedSubscriber.<DataBuffer>create()
-				.consumeNextWith(buf -> {
-					String content = DataBufferTestUtils.dumpString(buf, StandardCharsets.UTF_8);
-					String[] ranges = StringUtils.tokenizeToStringArray(content, "\r\n",
-							false, true);
-					String[] expected = new String[] {
-							"--" + boundary,
-							"Content-Type: text/plain",
-							"Content-Range: bytes 0-5/39",
-							"Spring",
-							"--" + boundary,
-							"Content-Type: text/plain",
-							"Content-Range: bytes 7-15/39",
-							"Framework",
-							"--" + boundary,
-							"Content-Type: text/plain",
-							"Content-Range: bytes 17-20/39",
-							"test",
-							"--" + boundary,
-							"Content-Type: text/plain",
-							"Content-Range: bytes 22-38/39",
-							"resource content.",
-							"--" + boundary + "--"
-					};
-					assertArrayEquals(expected, ranges);
-				})
+		StepVerifier.create(result)
+				.consumeNextWith(stringConsumer("\r\n--" + boundary + "\r\n"))
+				.consumeNextWith(stringConsumer("Content-Type: text/plain\r\n"))
+				.consumeNextWith(stringConsumer("Content-Range: bytes 0-5/39\r\n\r\n"))
+				.consumeNextWith(stringConsumer("Spring"))
+				.consumeNextWith(stringConsumer("\r\n--" + boundary + "\r\n"))
+				.consumeNextWith(stringConsumer("Content-Type: text/plain\r\n"))
+				.consumeNextWith(stringConsumer("Content-Range: bytes 7-15/39\r\n\r\n"))
+				.consumeNextWith(stringConsumer("Framework"))
+				.consumeNextWith(stringConsumer("\r\n--" + boundary + "\r\n"))
+				.consumeNextWith(stringConsumer("Content-Type: text/plain\r\n"))
+				.consumeNextWith(stringConsumer("Content-Range: bytes 17-20/39\r\n\r\n"))
+				.consumeNextWith(stringConsumer("test"))
+				.consumeNextWith(stringConsumer("\r\n--" + boundary + "\r\n"))
+				.consumeNextWith(stringConsumer("Content-Type: text/plain\r\n"))
+				.consumeNextWith(stringConsumer("Content-Range: bytes 22-38/39\r\n\r\n"))
+				.consumeNextWith(stringConsumer("resource content."))
+				.consumeNextWith(stringConsumer("\r\n--" + boundary + "--"))
 				.expectComplete()
-				.verify(reduced);
+				.verify();
 	}
+
+	@Test
+	public void nonExisting() {
+		Resource resource = new ClassPathResource("ResourceRegionEncoderTests.txt", getClass());
+		Resource nonExisting = new ClassPathResource("does not exist", getClass());
+		Flux<ResourceRegion> regions = Flux.just(
+				new ResourceRegion(resource, 0, 6),
+				new ResourceRegion(nonExisting, 0, 6));
+
+		String boundary = MimeTypeUtils.generateMultipartBoundaryString();
+
+		Flux<DataBuffer> result = this.encoder.encode(regions, this.bufferFactory,
+				ResolvableType.forClass(ResourceRegion.class),
+				MimeType.valueOf("text/plain"),
+				Collections.singletonMap(ResourceRegionEncoder.BOUNDARY_STRING_HINT, boundary));
+
+		StepVerifier.create(result)
+				.consumeNextWith(stringConsumer("\r\n--" + boundary + "\r\n"))
+				.consumeNextWith(stringConsumer("Content-Type: text/plain\r\n"))
+				.consumeNextWith(stringConsumer("Content-Range: bytes 0-5/39\r\n\r\n"))
+				.consumeNextWith(stringConsumer("Spring"))
+				.expectError(EncodingException.class)
+				.verify();
+	}
+
+	protected Consumer<DataBuffer> stringConsumer(String expected) {
+		return dataBuffer -> {
+			String value =
+					DataBufferTestUtils.dumpString(dataBuffer, UTF_8);
+			DataBufferUtils.release(dataBuffer);
+			assertEquals(expected, value);
+		};
+	}
+
 
 }

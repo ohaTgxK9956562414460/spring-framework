@@ -1,5 +1,5 @@
 /*
- * Copyright 2002-2016 the original author or authors.
+ * Copyright 2002-2017 the original author or authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -27,6 +27,7 @@ import org.springframework.beans.factory.support.MergedBeanDefinitionPostProcess
 import org.springframework.beans.factory.support.RootBeanDefinition;
 import org.springframework.context.ApplicationListener;
 import org.springframework.context.event.ApplicationEventMulticaster;
+import org.springframework.util.ObjectUtils;
 
 /**
  * {@code BeanPostProcessor} that detects beans which implement the {@code ApplicationListener}
@@ -45,9 +46,9 @@ class ApplicationListenerDetector implements DestructionAwareBeanPostProcessor, 
 
 	private static final Log logger = LogFactory.getLog(ApplicationListenerDetector.class);
 
-	private transient final AbstractApplicationContext applicationContext;
+	private final transient AbstractApplicationContext applicationContext;
 
-	private transient final Map<String, Boolean> singletonNames = new ConcurrentHashMap<>(256);
+	private final transient Map<String, Boolean> singletonNames = new ConcurrentHashMap<>(256);
 
 
 	public ApplicationListenerDetector(AbstractApplicationContext applicationContext) {
@@ -57,9 +58,7 @@ class ApplicationListenerDetector implements DestructionAwareBeanPostProcessor, 
 
 	@Override
 	public void postProcessMergedBeanDefinition(RootBeanDefinition beanDefinition, Class<?> beanType, String beanName) {
-		if (this.applicationContext != null && beanDefinition.isSingleton()) {
-			this.singletonNames.put(beanName, Boolean.TRUE);
-		}
+		this.singletonNames.put(beanName, beanDefinition.isSingleton());
 	}
 
 	@Override
@@ -69,14 +68,14 @@ class ApplicationListenerDetector implements DestructionAwareBeanPostProcessor, 
 
 	@Override
 	public Object postProcessAfterInitialization(Object bean, String beanName) {
-		if (this.applicationContext != null && bean instanceof ApplicationListener) {
+		if (bean instanceof ApplicationListener) {
 			// potentially not detected as a listener by getBeanNamesForType retrieval
 			Boolean flag = this.singletonNames.get(beanName);
 			if (Boolean.TRUE.equals(flag)) {
 				// singleton bean (top-level or inner): register on the fly
 				this.applicationContext.addApplicationListener((ApplicationListener<?>) bean);
 			}
-			else if (flag == null) {
+			else if (Boolean.FALSE.equals(flag)) {
 				if (logger.isWarnEnabled() && !this.applicationContext.containsBean(beanName)) {
 					// inner bean with other scope - can't reliably process events
 					logger.warn("Inner bean '" + beanName + "' implements ApplicationListener interface " +
@@ -84,7 +83,7 @@ class ApplicationListenerDetector implements DestructionAwareBeanPostProcessor, 
 							"because it does not have singleton scope. Only top-level listener beans are allowed " +
 							"to be of non-singleton scope.");
 				}
-				this.singletonNames.put(beanName, Boolean.FALSE);
+				this.singletonNames.remove(beanName);
 			}
 		}
 		return bean;
@@ -93,9 +92,14 @@ class ApplicationListenerDetector implements DestructionAwareBeanPostProcessor, 
 	@Override
 	public void postProcessBeforeDestruction(Object bean, String beanName) {
 		if (bean instanceof ApplicationListener) {
-			ApplicationEventMulticaster multicaster = this.applicationContext.getApplicationEventMulticaster();
-			multicaster.removeApplicationListener((ApplicationListener<?>) bean);
-			multicaster.removeApplicationListenerBean(beanName);
+			try {
+				ApplicationEventMulticaster multicaster = this.applicationContext.getApplicationEventMulticaster();
+				multicaster.removeApplicationListener((ApplicationListener<?>) bean);
+				multicaster.removeApplicationListenerBean(beanName);
+			}
+			catch (IllegalStateException ex) {
+				// ApplicationEventMulticaster not initialized yet - no need to remove a listener
+			}
 		}
 	}
 
@@ -113,7 +117,7 @@ class ApplicationListenerDetector implements DestructionAwareBeanPostProcessor, 
 
 	@Override
 	public int hashCode() {
-		return this.applicationContext.hashCode();
+		return ObjectUtils.nullSafeHashCode(this.applicationContext);
 	}
 
 }

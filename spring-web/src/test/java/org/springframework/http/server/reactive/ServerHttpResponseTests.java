@@ -1,5 +1,5 @@
 /*
- * Copyright 2002-2016 the original author or authors.
+ * Copyright 2002-2018 the original author or authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -27,7 +27,9 @@ import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 
 import org.springframework.core.io.buffer.DataBuffer;
+import org.springframework.core.io.buffer.DefaultDataBuffer;
 import org.springframework.core.io.buffer.DefaultDataBufferFactory;
+import org.springframework.http.HttpHeaders;
 import org.springframework.http.ResponseCookie;
 
 import static junit.framework.TestCase.assertTrue;
@@ -40,6 +42,7 @@ import static org.junit.Assert.assertSame;
  * @author Sebastien Deleuze
  */
 public class ServerHttpResponseTests {
+
 
 	@Test
 	public void writeWith() throws Exception {
@@ -56,15 +59,31 @@ public class ServerHttpResponseTests {
 		assertEquals("c", new String(response.body.get(2).asByteBuffer().array(), StandardCharsets.UTF_8));
 	}
 
+	@Test  // SPR-14952
+	public void writeAndFlushWithFluxOfDefaultDataBuffer() throws Exception {
+		TestServerHttpResponse response = new TestServerHttpResponse();
+		Flux<Flux<DefaultDataBuffer>> flux = Flux.just(Flux.just(wrap("foo")));
+		response.writeAndFlushWith(flux).block();
+
+		assertTrue(response.statusCodeWritten);
+		assertTrue(response.headersWritten);
+		assertTrue(response.cookiesWritten);
+
+		assertEquals(1, response.body.size());
+		assertEquals("foo", new String(response.body.get(0).asByteBuffer().array(), StandardCharsets.UTF_8));
+	}
+
 	@Test
 	public void writeWithError() throws Exception {
 		TestServerHttpResponse response = new TestServerHttpResponse();
+		response.getHeaders().setContentLength(12);
 		IllegalStateException error = new IllegalStateException("boo");
-		response.writeWith(Flux.error(error)).otherwise(ex -> Mono.empty()).block();
+		response.writeWith(Flux.error(error)).onErrorResume(ex -> Mono.empty()).block();
 
 		assertFalse(response.statusCodeWritten);
 		assertFalse(response.headersWritten);
 		assertFalse(response.cookiesWritten);
+		assertFalse(response.getHeaders().containsKey(HttpHeaders.CONTENT_LENGTH));
 		assertTrue(response.body.isEmpty());
 	}
 
@@ -83,10 +102,7 @@ public class ServerHttpResponseTests {
 	public void beforeCommitWithComplete() throws Exception {
 		ResponseCookie cookie = ResponseCookie.from("ID", "123").build();
 		TestServerHttpResponse response = new TestServerHttpResponse();
-		response.beforeCommit(() -> {
-			response.getCookies().add(cookie.getName(), cookie);
-			return Mono.empty();
-		});
+		response.beforeCommit(() -> Mono.fromRunnable(() -> response.getCookies().add(cookie.getName(), cookie)));
 		response.writeWith(Flux.just(wrap("a"), wrap("b"), wrap("c"))).block();
 
 		assertTrue(response.statusCodeWritten);
@@ -119,7 +135,7 @@ public class ServerHttpResponseTests {
 
 
 
-	private DataBuffer wrap(String a) {
+	private DefaultDataBuffer wrap(String a) {
 		return new DefaultDataBufferFactory().wrap(ByteBuffer.wrap(a.getBytes(StandardCharsets.UTF_8)));
 	}
 
@@ -136,6 +152,11 @@ public class ServerHttpResponseTests {
 
 		public TestServerHttpResponse() {
 			super(new DefaultDataBufferFactory());
+		}
+
+		@Override
+		public <T> T getNativeResponse() {
+			throw new IllegalStateException("This is a mock. No running server, no native response.");
 		}
 
 		@Override
@@ -157,7 +178,7 @@ public class ServerHttpResponseTests {
 		}
 
 		@Override
-		protected Mono<Void> writeWithInternal(Publisher<DataBuffer> body) {
+		protected Mono<Void> writeWithInternal(Publisher<? extends DataBuffer> body) {
 			return Flux.from(body).map(b -> {
 				this.body.add(b);
 				return b;
@@ -166,8 +187,13 @@ public class ServerHttpResponseTests {
 
 		@Override
 		protected Mono<Void> writeAndFlushWithInternal(
-				Publisher<Publisher<DataBuffer>> body) {
-			return Mono.error(new UnsupportedOperationException());
+				Publisher<? extends Publisher<? extends DataBuffer>> bodyWithFlush) {
+			return Flux.from(bodyWithFlush).flatMap(body ->
+				Flux.from(body).map(b -> {
+					this.body.add(b);
+					return b;
+				})
+			).then();
 		}
 	}
 
